@@ -5,6 +5,7 @@
 """
 import re
 import io
+import json
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -17,6 +18,13 @@ st.set_page_config(page_title="续班多维分析系统", layout="wide")
 
 REQUIRED_COLS = ["课程名称", "班级名称", "校区", "上课时间", "任课老师", "学号",
                   "姓名", "性别", "课程年级", "科目", "类型", "手机号码", "交费时间"]
+
+DEFAULT_CONFIG = {
+    "label1": "暑假报名名单", "label2": "秋季续费验证",
+    "w_normal": 1.0, "w_g6": 1.3, "w_g6e": 1.3, "w_elite": 1.2,
+    "nodes_str": "2026-06-01,2026-07-01,2026-08-01",
+    "selected_types": None,
+}
 
 # ============================================================
 # 工具函数
@@ -217,10 +225,72 @@ def gender_analysis(detail):
     fig.update_traces(texttemplate="%{y:.1%}")
     fig.update_yaxes(tickformat=".0%")
     return g, fig
+def school_analysis(detail):
+    total = len(detail)
+    success = (detail["续班结果"] == "续班成功").sum()
+    not_renew = (detail["续班结果"] == "未续班").sum()
+    mismatch = (detail["续班结果"] == "学号不匹配").sum()
+    rate = success / total if total else 0
+
+    # 方式一：学号不匹配 归入 未续班（二分类）
+    df_binary = pd.DataFrame({
+        "结果": ["续班成功", "未续班（含学号不匹配）"],
+        "人数": [success, not_renew + mismatch]
+    })
+    fig_binary = px.pie(df_binary, names="结果", values="人数", hole=0.5,
+                         title="全校续班率（学号不匹配计入未续班）")
+    fig_binary.update_traces(textinfo="label+percent")
+
+    # 方式二：三类明细（续班成功 / 未续班 / 学号不匹配）
+    df_detail = pd.DataFrame({
+        "结果": ["续班成功", "未续班", "学号不匹配"],
+        "人数": [success, not_renew, mismatch]
+    })
+    fig_detail = px.pie(df_detail, names="结果", values="人数", hole=0.5,
+                         title="全校续班率明细（三类）")
+    fig_detail.update_traces(textinfo="label+percent")
+
+    return total, success, rate, df_binary, fig_binary, df_detail, fig_detail
+
+# ============================================================
+# 图表/数据 分开展示组件（默认图表，按钮切换到数据）
+# ============================================================
+def render_section(key, figs, df, chart_height=720):
+    """
+    key：本区块唯一标识（用于session_state隔离）
+    figs：该维度下所有需要展示的图表（list[plotly.Figure]）
+    df：该维度对应的数据表
+    chart_height：单个图表高度（px），图表默认放大铺满宽度
+    """
+    state_key = f"view_mode_{key}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = "chart"  # 默认展示图表
+
+    col_a, col_b, col_spacer = st.columns([1, 1, 4])
+    with col_a:
+        if st.button("📈 图表", key=f"btn_chart_{key}", use_container_width=True,
+                      type="primary" if st.session_state[state_key] == "chart" else "secondary"):
+            st.session_state[state_key] = "chart"
+    with col_b:
+        if st.button("📋 数据", key=f"btn_data_{key}", use_container_width=True,
+                      type="primary" if st.session_state[state_key] == "data" else "secondary"):
+            st.session_state[state_key] = "data"
+
+    st.write("")  # 轻微留白
+
+    if st.session_state[state_key] == "chart":
+        # 只展示图表，不渲染数据表，避免图表被压缩变小
+        for fig in figs:
+            fig.update_layout(height=chart_height, margin=dict(l=40, r=40, t=60, b=40))
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        # 只展示数据，不渲染图表
+        table_height = min(700, 40 * (len(df) + 1) + 40)
+        st.dataframe(df, use_container_width=True, height=table_height)
 
 
 # ============================================================
-# Excel 导出（保留原有功能：续班明细 + 老师统计公式表）
+# Excel 导出（续班明细 + 老师统计公式表）
 # ============================================================
 def autofit_columns(ws, df, extra_width=2):
     for i, col in enumerate(df.columns, start=1):
@@ -315,23 +385,46 @@ def export_excel(detail_df, weights):
 st.title("📊 续班多维分析系统")
 
 with st.sidebar:
+    st.header("⓪ 配置文件")
+    cfg_file = st.file_uploader("导入配置文件（config.json）", type=["json"], key="cfg_uploader")
+    if cfg_file is not None:
+        try:
+            loaded_cfg = json.load(cfg_file)
+            st.session_state["cfg"] = {**DEFAULT_CONFIG, **loaded_cfg}
+            st.success("配置已导入")
+        except Exception as e:
+            st.error(f"配置文件解析失败：{e}")
+    cfg = st.session_state.get("cfg", DEFAULT_CONFIG)
+
     st.header("① 数据上传")
-    label1 = st.text_input("数据1 含义", value="暑假报名名单")
-    label2 = st.text_input("数据2 含义（续班验证）", value="秋季续费验证")
+    label1 = st.text_input("数据1 含义", value=cfg["label1"])
+    label2 = st.text_input("数据2 含义（续班验证）", value=cfg["label2"])
     file1 = st.file_uploader(f"上传数据1（{label1}）", type=["xlsx"], key="f1")
     file2 = st.file_uploader(f"上传数据2（{label2}）", type=["xlsx"], key="f2")
 
     st.header("② 加权系数（老师维度专用）")
-    w_normal = st.number_input("普通班", value=1.0, step=0.1)
-    w_g6 = st.number_input("六年级非精品班", value=1.3, step=0.1)
-    w_g6e = st.number_input("六年级精品班", value=1.3, step=0.1)
-    w_elite = st.number_input("精品班（非六年级）", value=1.2, step=0.1)
+    w_normal = st.number_input("普通班", value=cfg["w_normal"], step=0.1)
+    w_g6 = st.number_input("六年级非精品班", value=cfg["w_g6"], step=0.1)
+    w_g6e = st.number_input("六年级精品班", value=cfg["w_g6e"], step=0.1)
+    w_elite = st.number_input("精品班（非六年级）", value=cfg["w_elite"], step=0.1)
     WEIGHTS = {"普通": w_normal, "六年级非精品班": w_g6, "六年级精品班": w_g6e, "精品班": w_elite}
 
     st.header("③ 交费时间分析节点")
-    nodes_str = st.text_input("多个日期用逗号分隔", value="2026-06-01,2026-07-01,2026-08-01")
+    nodes_str = st.text_input("多个日期用逗号分隔", value=cfg["nodes_str"])
 
     run_btn = st.button("🚀 开始计算", type="primary", use_container_width=True)
+
+    st.divider()
+    current_cfg = {
+        "label1": label1, "label2": label2,
+        "w_normal": w_normal, "w_g6": w_g6, "w_g6e": w_g6e, "w_elite": w_elite,
+        "nodes_str": nodes_str,
+        "selected_types": st.session_state.get("selected_types_saved"),
+    }
+    st.download_button("💾 保存当前配置为 config.json",
+                        data=json.dumps(current_cfg, ensure_ascii=False, indent=2).encode("utf-8"),
+                        file_name="config.json", mime="application/json",
+                        use_container_width=True)
 
 if "df1_raw" not in st.session_state:
     st.session_state.df1_raw = None
@@ -355,7 +448,10 @@ if st.session_state.df1_raw is not None:
 
     st.subheader("④ 班型过滤")
     all_types = sorted(df1["班型"].unique())
-    selected_types = st.multiselect("勾选参与计算的班型（默认全选）", all_types, default=all_types)
+    saved_types = cfg.get("selected_types")
+    default_types = [t for t in saved_types if t in all_types] if saved_types else all_types
+    selected_types = st.multiselect("勾选参与计算的班型（默认全选）", all_types, default=default_types)
+    st.session_state["selected_types_saved"] = selected_types
 
     df1_filtered = df1[df1["班型"].isin(selected_types)].reset_index(drop=True)
     if df1_filtered.empty:
@@ -371,35 +467,40 @@ if st.session_state.df1_raw is not None:
         st.error(f"时间节点解析失败：{e}")
         st.stop()
 
-    tabs = st.tabs(["教师分析", "校区分析", "年级×班型分析", "交费时效分析", "性别分析", "数据导出"])
+    tabs = st.tabs(["教师分析", "校区分析", "年级×班型分析", "交费时效分析", "性别分析", "全校整体", "数据导出"])
 
     with tabs[0]:
         t_df, t_fig = teacher_analysis(detail, WEIGHTS)
-        st.plotly_chart(t_fig, use_container_width=True)
-        st.dataframe(t_df)
+        render_section("teacher", [t_fig], t_df)
 
     with tabs[1]:
         c_df, c_fig = campus_analysis(detail)
-        st.plotly_chart(c_fig, use_container_width=True)
-        st.dataframe(c_df)
+        render_section("campus", [c_fig], c_df)
 
     with tabs[2]:
         gc_df, gc_fig = grade_classtype_analysis(detail)
-        st.plotly_chart(gc_fig, use_container_width=True)
-        st.dataframe(gc_df)
+        render_section("grade_class", [gc_fig], gc_df, chart_height=780)
 
     with tabs[3]:
         bar_df, fig_bar, fig_line = timeliness_analysis(detail, nodes)
-        st.plotly_chart(fig_bar, use_container_width=True)
-        st.plotly_chart(fig_line, use_container_width=True)
-        st.dataframe(bar_df)
+        render_section("timeliness", [fig_bar, fig_line], bar_df)
 
     with tabs[4]:
         g_df, g_fig = gender_analysis(detail)
-        st.plotly_chart(g_fig, use_container_width=True)
-        st.dataframe(g_df)
+        render_section("gender", [g_fig], g_df)
+    with tabs[5]:  # 新增：全校整体
+        total, success, rate, df_binary, fig_binary, df_detail, fig_detail = school_analysis(detail)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("总人数", total)
+        col2.metric("续班成功人数", success)
+        col3.metric("续班率", f"{rate:.1%}")
 
-    with tabs[5]:
+        st.write("#### 方式一：学号不匹配计入未续班")
+        render_section("school_binary", [fig_binary], df_binary)
+
+        st.write("#### 方式二：三类明细")
+    render_section("school_detail", [fig_detail], df_detail)
+    with tabs[6]:
         st.write("### Excel 结果（续班明细 + 老师统计，含公式）")
         excel_buf = export_excel(detail, WEIGHTS)
         st.download_button("⬇️ 下载 Excel 结果", data=excel_buf,
